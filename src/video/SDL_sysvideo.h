@@ -1,6 +1,6 @@
 /*
   Simple DirectMedia Layer
-  Copyright (C) 1997-2025 Sam Lantinga <slouken@libsdl.org>
+  Copyright (C) 1997-2026 Sam Lantinga <slouken@libsdl.org>
 
   This software is provided 'as-is', without any express or implied
   warranty.  In no event will the authors be held liable for any damages
@@ -313,6 +313,7 @@ struct SDL_VideoDevice
     bool (*FlashWindow)(SDL_VideoDevice *_this, SDL_Window *window, SDL_FlashOperation operation);
     bool (*ApplyWindowProgress)(SDL_VideoDevice *_this, SDL_Window *window);
     bool (*SetWindowFocusable)(SDL_VideoDevice *_this, SDL_Window *window, bool focusable);
+    bool (*SetWindowFillDocument)(SDL_VideoDevice *_this, SDL_Window *window, bool fill);
     bool (*SyncWindow)(SDL_VideoDevice *_this, SDL_Window *window);
     bool (*ReconfigureWindow)(SDL_VideoDevice *_this, SDL_Window *window, SDL_WindowFlags flags);
 
@@ -375,7 +376,7 @@ struct SDL_VideoDevice
     void (*SetTextInputProperties)(SDL_VideoDevice *_this, SDL_Window *window, SDL_PropertiesID props);
 
     // Clipboard
-    const char **(*GetTextMimeTypes)(SDL_VideoDevice *_this, size_t *num_mime_types);
+    const char *const *(*GetTextMimeTypes)(SDL_VideoDevice *_this, size_t *num_mime_types);
     bool (*SetClipboardData)(SDL_VideoDevice *_this);
     void *(*GetClipboardData)(SDL_VideoDevice *_this, const char *mime_type, size_t *size);
     bool (*HasClipboardData)(SDL_VideoDevice *_this, const char *mime_type);
@@ -423,6 +424,7 @@ struct SDL_VideoDevice
     Uint32 device_caps;
     SDL_SystemTheme system_theme;
     bool screen_keyboard_shown;
+    bool is_quitting;
 
     /* * * */
     // Data used by the GL drivers

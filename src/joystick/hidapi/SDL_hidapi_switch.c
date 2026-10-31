@@ -1,6 +1,6 @@
 /*
   Simple DirectMedia Layer
-  Copyright (C) 1997-2025 Sam Lantinga <slouken@libsdl.org>
+  Copyright (C) 1997-2026 Sam Lantinga <slouken@libsdl.org>
 
   This software is provided 'as-is', without any express or implied
   warranty.  In no event will the authors be held liable for any damages
@@ -450,7 +450,7 @@ static bool ReadProprietaryReply(SDL_DriverSwitch_Context *ctx, ESwitchProprieta
 
 static void ConstructSubcommand(SDL_DriverSwitch_Context *ctx, ESwitchSubcommandIDs ucCommandID, const Uint8 *pBuf, Uint8 ucLen, SwitchSubcommandOutputPacket_t *outPacket)
 {
-    SDL_memset(outPacket, 0, sizeof(*outPacket));
+    SDL_zerop(outPacket);
 
     outPacket->commonData.ucPacketType = k_eSwitchOutputReportIDs_RumbleAndSubcommand;
     outPacket->commonData.ucPacketNumber = ctx->m_nCommandNumber;
@@ -778,9 +778,10 @@ static void UpdateSlotLED(SDL_DriverSwitch_Context *ctx)
 {
     if (!ctx->m_bInputOnly) {
         Uint8 led_data = 0;
+        const Uint8 player_pattern[] = { 0x1, 0x3, 0x7, 0xf, 0x9, 0x5, 0xd, 0x6 };
 
         if (ctx->m_bPlayerLights && ctx->m_nPlayerIndex >= 0) {
-            led_data = (1 << (ctx->m_nPlayerIndex % 4));
+            led_data = player_pattern[ctx->m_nPlayerIndex % 8];
         }
         WriteSubcommand(ctx, k_eSwitchSubcommandIDs_SetPlayerLights, &led_data, sizeof(led_data), NULL);
     }
@@ -959,14 +960,14 @@ static bool SetIMUEnabled(SDL_DriverSwitch_Context *ctx, bool enabled)
 
 static bool LoadStickCalibration(SDL_DriverSwitch_Context *ctx)
 {
-    Uint8 *pLeftStickCal = NULL;
-    Uint8 *pRightStickCal = NULL;
+    Uint8 pLeftStickCal[9];
+    Uint8 pRightStickCal[9];
+    bool have_left_stick_cal = false, have_right_stick_cal = false;
     size_t stick, axis;
     SwitchSubcommandInputPacket_t *user_reply = NULL;
     SwitchSubcommandInputPacket_t *factory_reply = NULL;
     SwitchSPIOpData_t readUserParams;
     SwitchSPIOpData_t readFactoryParams;
-    Uint8 userParamsReadSuccessCount = 0;
 
     // Read User Calibration Info
     readUserParams.unAddress = k_unSPIStickUserCalibrationStartOffset;
@@ -981,17 +982,17 @@ static bool LoadStickCalibration(SDL_DriverSwitch_Context *ctx)
 
     // Automatically select the user calibration if magic bytes are set
     if (user_reply && user_reply->stickUserCalibration.rgucLeftMagic[0] == 0xB2 && user_reply->stickUserCalibration.rgucLeftMagic[1] == 0xA1) {
-        userParamsReadSuccessCount += 1;
-        pLeftStickCal = user_reply->stickUserCalibration.rgucLeftCalibration;
+        have_left_stick_cal = true;
+        SDL_memcpy(pLeftStickCal, user_reply->stickUserCalibration.rgucLeftCalibration, sizeof(pLeftStickCal));
     }
 
     if (user_reply && user_reply->stickUserCalibration.rgucRightMagic[0] == 0xB2 && user_reply->stickUserCalibration.rgucRightMagic[1] == 0xA1) {
-        userParamsReadSuccessCount += 1;
-        pRightStickCal = user_reply->stickUserCalibration.rgucRightCalibration;
+        have_right_stick_cal = true;
+        SDL_memcpy(pRightStickCal, user_reply->stickUserCalibration.rgucRightCalibration, sizeof(pRightStickCal));
     }
 
     // Only read the factory calibration info if we failed to receive the correct magic bytes
-    if (userParamsReadSuccessCount < 2) {
+    if (!have_left_stick_cal || !have_right_stick_cal) {
         // Read Factory Calibration Info
         readFactoryParams.unAddress = k_unSPIStickFactoryCalibrationStartOffset;
         readFactoryParams.ucLength = k_unSPIStickFactoryCalibrationLength;
@@ -1004,8 +1005,17 @@ static bool LoadStickCalibration(SDL_DriverSwitch_Context *ctx)
 
             if (factory_reply->stickFactoryCalibration.opData.unAddress == k_unSPIStickFactoryCalibrationStartOffset) {
                 // We successfully read the calibration data
-                pLeftStickCal = factory_reply->stickFactoryCalibration.rgucLeftCalibration;
-                pRightStickCal = factory_reply->stickFactoryCalibration.rgucRightCalibration;
+                // Avoid overriding user calibration if it's present for only one stick (known to happen on JoyCons)
+                if (!have_left_stick_cal) {
+                    have_left_stick_cal = true;
+                    SDL_memcpy(pLeftStickCal, factory_reply->stickFactoryCalibration.rgucLeftCalibration, sizeof(pLeftStickCal));
+                }
+
+                if (!have_right_stick_cal) {
+                    have_right_stick_cal = true;
+                    SDL_memcpy(pRightStickCal, factory_reply->stickFactoryCalibration.rgucRightCalibration, sizeof(pRightStickCal));
+                }
+
                 break;
             }
 
@@ -1016,7 +1026,7 @@ static bool LoadStickCalibration(SDL_DriverSwitch_Context *ctx)
     }
 
     // If we still don't have calibration data, return false
-    if (pLeftStickCal == NULL || pRightStickCal == NULL)
+    if (!have_left_stick_cal || !have_right_stick_cal)
     {
         return false;
     }
@@ -1457,11 +1467,11 @@ static void UpdateDeviceIdentity(SDL_HIDAPI_Device *device)
             device->type = SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO;
             break;
         case k_eSwitchDeviceInfoControllerType_HVCLeft:
-            HIDAPI_SetDeviceName(device, "Nintendo HVC Controller (1)");
+            HIDAPI_SetDeviceName(device, "Nintendo Family Computer Controller (1)");
             device->type = SDL_GAMEPAD_TYPE_STANDARD;
             break;
         case k_eSwitchDeviceInfoControllerType_HVCRight:
-            HIDAPI_SetDeviceName(device, "Nintendo HVC Controller (2)");
+            HIDAPI_SetDeviceName(device, "Nintendo Family Computer Controller (2)");
             device->type = SDL_GAMEPAD_TYPE_STANDARD;
             break;
         case k_eSwitchDeviceInfoControllerType_NESLeft:
@@ -1811,16 +1821,29 @@ static Uint32 HIDAPI_DriverSwitch_GetJoystickCapabilities(SDL_HIDAPI_Device *dev
     if (ctx->m_eControllerType == k_eSwitchDeviceInfoControllerType_ProController && !ctx->m_bInputOnly) {
         // Doesn't have an RGB LED, so don't return SDL_JOYSTICK_CAP_RGB_LED here
         result |= SDL_JOYSTICK_CAP_RUMBLE;
+        // But has the HOME LED, so treat it like a mono LED
+        result |= SDL_JOYSTICK_CAP_MONO_LED;
     } else if (ctx->m_eControllerType == k_eSwitchDeviceInfoControllerType_JoyConLeft ||
                ctx->m_eControllerType == k_eSwitchDeviceInfoControllerType_JoyConRight) {
         result |= SDL_JOYSTICK_CAP_RUMBLE;
+        if (ctx->m_eControllerType == k_eSwitchDeviceInfoControllerType_JoyConRight) {
+            result |= SDL_JOYSTICK_CAP_MONO_LED; // Right JoyCon also have the HOME LED
+        }
     }
     return result;
 }
 
 static bool HIDAPI_DriverSwitch_SetJoystickLED(SDL_HIDAPI_Device *device, SDL_Joystick *joystick, Uint8 red, Uint8 green, Uint8 blue)
 {
-    return SDL_Unsupported();
+    SDL_DriverSwitch_Context *ctx = (SDL_DriverSwitch_Context *)device->context;
+
+    if (!(ctx->m_eControllerType == k_eSwitchDeviceInfoControllerType_ProController && !ctx->m_bInputOnly) &&
+        ctx->m_eControllerType != k_eSwitchDeviceInfoControllerType_JoyConRight) {
+        return SDL_Unsupported();
+    }
+
+    int value = (int)((SDL_max(red, SDL_max(green, blue)) / 255.0f) * 100.0f); // The colors are received between 0-255 and we need them to be 0-100
+    return SetHomeLED(ctx, (Uint8)value);
 }
 
 static bool HIDAPI_DriverSwitch_SendJoystickEffect(SDL_HIDAPI_Device *device, SDL_Joystick *joystick, const void *data, int size)

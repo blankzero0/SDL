@@ -1,6 +1,6 @@
 /*
   Simple DirectMedia Layer
-  Copyright (C) 1997-2025 Sam Lantinga <slouken@libsdl.org>
+  Copyright (C) 1997-2026 Sam Lantinga <slouken@libsdl.org>
 
   This software is provided 'as-is', without any express or implied
   warranty.  In no event will the authors be held liable for any damages
@@ -1161,6 +1161,8 @@ static SDL_JoystickID LINUX_JoystickGetDeviceInstanceID(int device_index)
 
 static bool allocate_balldata(SDL_Joystick *joystick)
 {
+    SDL_AssertJoysticksLocked();
+
     joystick->hwdata->balls =
         (struct hwdata_ball *)SDL_calloc(joystick->nballs, sizeof(struct hwdata_ball));
     if (joystick->hwdata->balls == NULL) {
@@ -1537,7 +1539,7 @@ static SDL_sensorlist_item *GetSensor(SDL_joylist_item *item)
         return NULL;
     }
 
-    SDL_memset(uniq_item, 0, sizeof(uniq_item));
+    SDL_zeroa(uniq_item);
     fd_item = open(item->path, O_RDONLY | O_CLOEXEC, 0);
     if (fd_item < 0) {
         return NULL;
@@ -1559,7 +1561,7 @@ static SDL_sensorlist_item *GetSensor(SDL_joylist_item *item)
             continue;
         }
 
-        SDL_memset(uniq_sensor, 0, sizeof(uniq_sensor));
+        SDL_zeroa(uniq_sensor);
         fd_sensor = open(item_sensor->path, O_RDONLY | O_CLOEXEC, 0);
         if (fd_sensor < 0) {
             continue;
@@ -1776,6 +1778,8 @@ static void HandleHat(Uint64 timestamp, SDL_Joystick *stick, int hatidx, int axi
 
 static void HandleBall(SDL_Joystick *stick, Uint8 ball, int axis, int value)
 {
+    SDL_AssertJoysticksLocked();
+
     stick->hwdata->balls[ball].axis[axis] += value;
 }
 
@@ -2082,7 +2086,7 @@ static void HandleInputEvents(SDL_Joystick *joystick)
                     if (code == MSC_TIMESTAMP) {
                         Sint32 tick = event->value;
                         Sint32 delta;
-                        if (joystick->hwdata->last_tick < tick) {
+                        if (joystick->hwdata->last_tick <= tick) {
                             delta = (tick - joystick->hwdata->last_tick);
                         } else {
                             delta = (SDL_MAX_SINT32 - joystick->hwdata->last_tick + tick + 1);

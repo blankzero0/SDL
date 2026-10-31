@@ -1,6 +1,6 @@
 /*
   Simple DirectMedia Layer
-  Copyright (C) 1997-2025 Sam Lantinga <slouken@libsdl.org>
+  Copyright (C) 1997-2026 Sam Lantinga <slouken@libsdl.org>
 
   This software is provided 'as-is', without any express or implied
   warranty.  In no event will the authors be held liable for any damages
@@ -395,9 +395,11 @@ static bool VULKAN_UpdateTextureInternal(VULKAN_RenderData *rendererData, VkImag
 static SDL_PixelFormat VULKAN_VkFormatToSDLPixelFormat(VkFormat vkFormat)
 {
     switch (vkFormat) {
-    case VK_FORMAT_B8G8R8A8_UNORM:
-        return SDL_PIXELFORMAT_ARGB8888;
     case VK_FORMAT_R8G8B8A8_UNORM:
+        return SDL_PIXELFORMAT_RGBA32;
+    case VK_FORMAT_B8G8R8A8_UNORM:
+        return SDL_PIXELFORMAT_BGRA32;
+    case VK_FORMAT_A8B8G8R8_UNORM_PACK32:
         return SDL_PIXELFORMAT_ABGR8888;
     case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
         return SDL_PIXELFORMAT_ABGR2101010;
@@ -430,8 +432,12 @@ static VkDeviceSize VULKAN_GetBytesPerPixel(VkFormat vkFormat, int plane)
         return 2;
     case VK_FORMAT_R16G16_UNORM:
         return 4;
+    case VK_FORMAT_R8G8B8A8_SRGB:
+    case VK_FORMAT_R8G8B8A8_UNORM:
     case VK_FORMAT_B8G8R8A8_SRGB:
     case VK_FORMAT_B8G8R8A8_UNORM:
+    case VK_FORMAT_A8B8G8R8_SRGB_PACK32:
+    case VK_FORMAT_A8B8G8R8_UNORM_PACK32:
     case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
         return 4;
     case VK_FORMAT_R16G16B16A16_SFLOAT:
@@ -440,6 +446,8 @@ static VkDeviceSize VULKAN_GetBytesPerPixel(VkFormat vkFormat, int plane)
         return 1;
     case VK_FORMAT_G8_B8R8_2PLANE_420_UNORM:
         return (plane == 0) ? 1 : 2;
+    case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16:
+        return (plane == 0) ? 2 : 4;
     default:
         return 4;
     }
@@ -452,16 +460,23 @@ static VkFormat SDLPixelFormatToVkTextureFormat(Uint32 format, Uint32 output_col
         return VK_FORMAT_R16G16B16A16_SFLOAT;
     case SDL_PIXELFORMAT_ABGR2101010:
         return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
-    case SDL_PIXELFORMAT_ARGB8888:
-        if (output_colorspace == SDL_COLORSPACE_SRGB_LINEAR) {
-            return VK_FORMAT_B8G8R8A8_SRGB;
-        }
-        return VK_FORMAT_B8G8R8A8_UNORM;
-    case SDL_PIXELFORMAT_ABGR8888:
+    case SDL_PIXELFORMAT_RGBA32:
         if (output_colorspace == SDL_COLORSPACE_SRGB_LINEAR) {
             return VK_FORMAT_R8G8B8A8_SRGB;
         }
         return VK_FORMAT_R8G8B8A8_UNORM;
+    case SDL_PIXELFORMAT_BGRA32:
+        if (output_colorspace == SDL_COLORSPACE_SRGB_LINEAR) {
+            return VK_FORMAT_B8G8R8A8_SRGB;
+        }
+        return VK_FORMAT_B8G8R8A8_UNORM;
+#if SDL_BYTEORDER == SDL_BIG_ENDIAN
+    case SDL_PIXELFORMAT_ABGR8888:
+        if (output_colorspace == SDL_COLORSPACE_SRGB_LINEAR) {
+            return VK_FORMAT_A8B8G8R8_SRGB_PACK32;
+        }
+        return VK_FORMAT_A8B8G8R8_UNORM_PACK32;
+#endif
     case SDL_PIXELFORMAT_INDEX8:
         return VK_FORMAT_R8_UNORM;
     case SDL_PIXELFORMAT_YUY2:
@@ -485,6 +500,8 @@ static void VULKAN_DestroyTexture(SDL_Renderer *renderer, SDL_Texture *texture);
 static void VULKAN_DestroyBuffer(VULKAN_RenderData *rendererData, VULKAN_Buffer *vulkanBuffer);
 static void VULKAN_DestroyImage(VULKAN_RenderData *rendererData, VULKAN_Image *vulkanImage);
 static void VULKAN_ResetCommandList(VULKAN_RenderData *rendererData);
+static void VULKAN_EnsureCommandBuffer(VULKAN_RenderData *rendererData);
+static void VULKAN_RecordPipelineImageBarrier(VULKAN_RenderData *rendererData, VkAccessFlags sourceAccessMask, VkAccessFlags destAccessMask, VkPipelineStageFlags srcStageFlags, VkPipelineStageFlags dstStageFlags, VkImageLayout destLayout, VkImage image, VkImageLayout *imageLayout);
 static bool VULKAN_FindMemoryTypeIndex(VULKAN_RenderData *rendererData, uint32_t typeBits, VkMemoryPropertyFlags requiredFlags, VkMemoryPropertyFlags desiredFlags, uint32_t *memoryTypeIndexOut);
 static VkResult VULKAN_CreateWindowSizeDependentResources(SDL_Renderer *renderer);
 static VkDescriptorPool VULKAN_AllocateDescriptorPool(VULKAN_RenderData *rendererData);
@@ -574,7 +591,7 @@ static void VULKAN_DestroyAll(SDL_Renderer *renderer)
     for (uint32_t i = 0; i < SDL_arraysize(rendererData->vertexBuffers); i++ ) {
         VULKAN_DestroyBuffer(rendererData, &rendererData->vertexBuffers[i]);
     }
-    SDL_memset(rendererData->vertexBuffers, 0, sizeof(rendererData->vertexBuffers));
+    SDL_zeroa(rendererData->vertexBuffers);
     for (uint32_t i = 0; i < VULKAN_RENDERPASS_COUNT; i++) {
         if (rendererData->renderPasses[i] != VK_NULL_HANDLE) {
             vkDestroyRenderPass(rendererData->device, rendererData->renderPasses[i], NULL);
@@ -701,7 +718,7 @@ static void VULKAN_DestroyBuffer(VULKAN_RenderData *rendererData, VULKAN_Buffer 
         vkFreeMemory(rendererData->device, vulkanBuffer->deviceMemory, NULL);
         vulkanBuffer->deviceMemory = VK_NULL_HANDLE;
     }
-    SDL_memset(vulkanBuffer, 0, sizeof(VULKAN_Buffer));
+    SDL_zerop(vulkanBuffer);
 }
 
 static VkResult VULKAN_AllocateBuffer(VULKAN_RenderData *rendererData, VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags requiredMemoryProps, VkMemoryPropertyFlags desiredMemoryProps, VULKAN_Buffer *bufferOut)
@@ -777,7 +794,7 @@ static void VULKAN_DestroyImage(VULKAN_RenderData *rendererData, VULKAN_Image *v
         }
         vulkanImage->deviceMemory = VK_NULL_HANDLE;
     }
-    SDL_memset(vulkanImage, 0, sizeof(VULKAN_Image));
+    SDL_zerop(vulkanImage);
 }
 
 static VkResult VULKAN_AllocateImage(VULKAN_RenderData *rendererData, SDL_PropertiesID create_props, uint32_t width, uint32_t height, VkFormat format, VkImageUsageFlags imageUsage, VkComponentMapping swizzle, VkSamplerYcbcrConversionKHR samplerYcbcrConversion, VULKAN_Image *imageOut)
@@ -785,7 +802,7 @@ static VkResult VULKAN_AllocateImage(VULKAN_RenderData *rendererData, SDL_Proper
     VkResult result;
     VkSamplerYcbcrConversionInfoKHR samplerYcbcrConversionInfo = { 0 };
 
-    SDL_memset(imageOut, 0, sizeof(VULKAN_Image));
+    SDL_zerop(imageOut);
     imageOut->format = format;
     imageOut->image = (VkImage)SDL_GetNumberProperty(create_props, SDL_PROP_TEXTURE_CREATE_VULKAN_TEXTURE_NUMBER, 0);
 
@@ -847,7 +864,19 @@ static VkResult VULKAN_AllocateImage(VULKAN_RenderData *rendererData, SDL_Proper
             return result;
         }
     } else {
-        imageOut->imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        imageOut->imageLayout = (VkImageLayout)SDL_GetNumberProperty(create_props, SDL_PROP_TEXTURE_CREATE_VULKAN_LAYOUT_NUMBER, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+
+    if (imageOut->imageLayout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+        VULKAN_EnsureCommandBuffer(rendererData);
+        VULKAN_RecordPipelineImageBarrier(rendererData,
+            VK_ACCESS_NONE,
+            VK_ACCESS_SHADER_READ_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            imageOut->image,
+            &imageOut->imageLayout);
     }
 
     VkImageViewCreateInfo imageViewCreateInfo = { 0 };
@@ -862,11 +891,16 @@ static VkResult VULKAN_AllocateImage(VULKAN_RenderData *rendererData, SDL_Proper
     imageViewCreateInfo.subresourceRange.baseArrayLayer = 0;
     imageViewCreateInfo.subresourceRange.layerCount = 1;
 
+    VkImageViewUsageCreateInfo imageViewUsageCreateInfo = { 0 };
+    imageViewUsageCreateInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO;
+    imageViewUsageCreateInfo.usage = imageUsage;
+    imageViewCreateInfo.pNext = &imageViewUsageCreateInfo;
+
     // If it's a YCbCr image, we need to pass the conversion info to the VkImageView (and the VkSampler)
     if (samplerYcbcrConversion != VK_NULL_HANDLE) {
         samplerYcbcrConversionInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO_KHR;
         samplerYcbcrConversionInfo.conversion = samplerYcbcrConversion;
-        imageViewCreateInfo.pNext = &samplerYcbcrConversionInfo;
+        imageViewUsageCreateInfo.pNext = &samplerYcbcrConversionInfo;
     }
 
     result = vkCreateImageView(rendererData->device, &imageViewCreateInfo, NULL, &imageOut->imageView);
@@ -1206,7 +1240,7 @@ static VULKAN_PipelineState *VULKAN_CreatePipelineState(SDL_Renderer *renderer,
     // Shaders
     const char *name = "main";
     for (uint32_t i = 0; i < 2; i++) {
-        SDL_memset(&shaderStageCreateInfo[i], 0, sizeof(shaderStageCreateInfo[i]));
+        SDL_zero(shaderStageCreateInfo[i]);
         shaderStageCreateInfo[i].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         shaderStageCreateInfo[i].module = (i == 0) ? rendererData->vertexShaderModules[shader] : rendererData->fragmentShaderModules[shader];
         shaderStageCreateInfo[i].stage = (i == 0) ? VK_SHADER_STAGE_VERTEX_BIT : VK_SHADER_STAGE_FRAGMENT_BIT;
@@ -1821,6 +1855,7 @@ static VkResult VULKAN_CreateDeviceResources(SDL_Renderer *renderer, SDL_Propert
     // Choose Vulkan physical device
     rendererData->physicalDevice = (VkPhysicalDevice)SDL_GetPointerProperty(create_props, SDL_PROP_RENDERER_CREATE_VULKAN_PHYSICAL_DEVICE_POINTER, NULL);
     if (rendererData->physicalDevice) {
+        vkGetPhysicalDeviceProperties(rendererData->physicalDevice, &rendererData->physicalDeviceProperties);
         vkGetPhysicalDeviceMemoryProperties(rendererData->physicalDevice, &rendererData->physicalDeviceMemoryProperties);
         vkGetPhysicalDeviceFeatures(rendererData->physicalDevice, &rendererData->physicalDeviceFeatures);
     } else {
@@ -2030,7 +2065,7 @@ static VkResult VULKAN_CreateFramebuffersAndRenderPasses(SDL_Renderer *renderer,
     VkFramebufferCreateInfo framebufferCreateInfo = { 0 };
     framebufferCreateInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
     framebufferCreateInfo.pNext = NULL;
-    framebufferCreateInfo.renderPass = rendererData->renderPasses[VULKAN_RENDERPASS_LOAD];
+    framebufferCreateInfo.renderPass = renderPasses[VULKAN_RENDERPASS_LOAD];
     framebufferCreateInfo.attachmentCount = 1;
     framebufferCreateInfo.width = w;
     framebufferCreateInfo.height = h;
@@ -2602,7 +2637,7 @@ static bool VULKAN_CreateTexture(SDL_Renderer *renderer, SDL_Texture *texture, S
     }
 
     if (textureFormat == VK_FORMAT_UNDEFINED) {
-        return SDL_SetError("%s, An unsupported SDL pixel format (0x%x) was specified", __FUNCTION__, texture->format);
+        return SDL_SetError("%s, An unsupported SDL pixel format (0x%x) was specified", SDL_FUNCTION, texture->format);
     }
 
     textureData = (VULKAN_TextureData *)SDL_calloc(1, sizeof(*textureData));
@@ -2705,11 +2740,11 @@ static bool VULKAN_CreateTexture(SDL_Renderer *renderer, SDL_Texture *texture, S
         // Also create VkSampler object which we will need to pass to the PSO as an immutable sampler
         VkSamplerCreateInfo samplerCreateInfo = { 0 };
         samplerCreateInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-        samplerCreateInfo.magFilter = VK_FILTER_NEAREST;
-        samplerCreateInfo.minFilter = VK_FILTER_NEAREST;
+        samplerCreateInfo.magFilter = VK_FILTER_LINEAR;
+        samplerCreateInfo.minFilter = VK_FILTER_LINEAR;
         samplerCreateInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-        samplerCreateInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-        samplerCreateInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        samplerCreateInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerCreateInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         samplerCreateInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         samplerCreateInfo.mipLodBias = 0.0f;
         samplerCreateInfo.anisotropyEnable = VK_FALSE;
@@ -2911,6 +2946,19 @@ static bool VULKAN_UpdateTextureInternal(VULKAN_RenderData *rendererData, VkImag
     return true;
 }
 
+#ifdef SDL_HAVE_YUV
+static bool VULKAN_UpdateTextureNV(SDL_Renderer *renderer, SDL_Texture *texture,
+                                   const SDL_Rect *rect,
+                                   const Uint8 *Yplane, int Ypitch,
+                                   const Uint8 *UVplane, int UVpitch);
+
+static bool VULKAN_UpdateTextureYUV(SDL_Renderer *renderer, SDL_Texture *texture,
+                                    const SDL_Rect *rect,
+                                    const Uint8 *Yplane, int Ypitch,
+                                    const Uint8 *Uplane, int Upitch,
+                                    const Uint8 *Vplane, int Vpitch);
+#endif
+
 static bool VULKAN_UpdateTexture(SDL_Renderer *renderer, SDL_Texture *texture,
                                const SDL_Rect *rect, const void *srcPixels,
                                int srcPitch)
@@ -2922,38 +2970,36 @@ static bool VULKAN_UpdateTexture(SDL_Renderer *renderer, SDL_Texture *texture,
         return SDL_SetError("Texture is not currently available");
     }
 
-    if (!VULKAN_UpdateTextureInternal(rendererData, textureData->mainImage.image, textureData->mainImage.format, 0, rect->x, rect->y, rect->w, rect->h, srcPixels, srcPitch, &textureData->mainImage.imageLayout)) {
-        return false;
-    }
 #ifdef SDL_HAVE_YUV
     Uint32 numPlanes = VULKAN_VkFormatGetNumPlanes(textureData->mainImage.format);
-    // Skip to the correct offset into the next texture
-    srcPixels = (const void *)((const Uint8 *)srcPixels + rect->h * srcPitch);
-    // YUV data
-    if (numPlanes == 3) {
-        for (Uint32 plane = 1; plane < numPlanes; plane++) {
-            if (!VULKAN_UpdateTextureInternal(rendererData, textureData->mainImage.image, textureData->mainImage.format, plane, rect->x / 2, rect->y / 2, (rect->w + 1) / 2, (rect->h + 1) / 2, srcPixels, (srcPitch + 1) / 2, &textureData->mainImage.imageLayout)) {
-                return false;
-            }
+    if (numPlanes == 2) {
+        // NV12/NV21 data
+        int UVbpp = (int)VULKAN_GetBytesPerPixel(textureData->mainImage.format, 1);
+        int Ypitch = srcPitch;
+        int UVpitch = (srcPitch + (UVbpp - 1)) & ~(UVbpp - 1);
+        const Uint8 *plane0 = (const Uint8 *)srcPixels;
+        const Uint8 *plane1 = plane0 + rect->h * srcPitch;
 
-            // Skip to the correct offset into the next texture
-            srcPixels = (const void *)((const Uint8 *)srcPixels + ((rect->h + 1) / 2) * ((srcPitch + 1) / 2));
-        }
-    }
-    // NV12/NV21 data
-    else if (numPlanes == 2)
-    {
-        if (texture->format == SDL_PIXELFORMAT_P010) {
-            srcPitch = (srcPitch + 3) & ~3;
+        return VULKAN_UpdateTextureNV(renderer, texture, rect, plane0, Ypitch, plane1, UVpitch);
+
+    } else if (numPlanes == 3) {
+        // YUV data
+        int Ypitch = srcPitch;
+        int UVpitch = ((Ypitch + 1) / 2);
+        const Uint8 *plane0 = (const Uint8 *)srcPixels;
+        const Uint8 *plane1 = plane0 + rect->h * Ypitch;
+        const Uint8 *plane2 = plane1 + ((rect->h + 1) / 2) * UVpitch;
+
+        if (texture->format == SDL_PIXELFORMAT_YV12) {
+            return VULKAN_UpdateTextureYUV(renderer, texture, rect, plane0, Ypitch, plane2, UVpitch, plane1, UVpitch);
         } else {
-            srcPitch = (srcPitch + 1) & ~1;
-        }
-
-        if (!VULKAN_UpdateTextureInternal(rendererData, textureData->mainImage.image, textureData->mainImage.format, 1, rect->x / 2, rect->y / 2, (rect->w + 1) / 2, (rect->h + 1) / 2, srcPixels, srcPitch, &textureData->mainImage.imageLayout)) {
-            return false;
+            return VULKAN_UpdateTextureYUV(renderer, texture, rect, plane0, Ypitch, plane1, UVpitch, plane2, UVpitch);
         }
     }
 #endif
+    if (!VULKAN_UpdateTextureInternal(rendererData, textureData->mainImage.image, textureData->mainImage.format, 0, rect->x, rect->y, rect->w, rect->h, srcPixels, srcPitch, &textureData->mainImage.imageLayout)) {
+        return false;
+    }
     return true;
 }
 
@@ -3117,9 +3163,24 @@ static bool VULKAN_SetRenderTarget(SDL_Renderer *renderer, SDL_Texture *texture)
 
     VULKAN_EnsureCommandBuffer(rendererData);
 
-    if (!texture) {
-        if (rendererData->textureRenderTarget) {
+    if (texture) {
+        textureData = (VULKAN_TextureData *)texture->internal;
 
+        if (textureData->mainImage.imageView == VK_NULL_HANDLE) {
+            return SDL_SetError("specified texture is not a render target");
+        }
+
+        rendererData->textureRenderTarget = textureData;
+        VULKAN_RecordPipelineImageBarrier(rendererData,
+            VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            rendererData->textureRenderTarget->mainImage.image,
+            &rendererData->textureRenderTarget->mainImage.imageLayout);
+    } else {
+        if (rendererData->textureRenderTarget) {
             VULKAN_RecordPipelineImageBarrier(rendererData,
                 VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
                 VK_ACCESS_SHADER_READ_BIT,
@@ -3130,24 +3191,9 @@ static bool VULKAN_SetRenderTarget(SDL_Renderer *renderer, SDL_Texture *texture)
                 &rendererData->textureRenderTarget->mainImage.imageLayout);
         }
         rendererData->textureRenderTarget = NULL;
-        return true;
     }
 
-    textureData = (VULKAN_TextureData *)texture->internal;
-
-    if (textureData->mainImage.imageView == VK_NULL_HANDLE) {
-        return SDL_SetError("specified texture is not a render target");
-    }
-
-    rendererData->textureRenderTarget = textureData;
-    VULKAN_RecordPipelineImageBarrier(rendererData,
-                VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-                VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-                VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                rendererData->textureRenderTarget->mainImage.image,
-                &rendererData->textureRenderTarget->mainImage.imageLayout);
+    VULKAN_IssueBatch(rendererData);
 
     return true;
 }
@@ -3312,7 +3358,7 @@ static bool VULKAN_UpdateViewport(SDL_Renderer *renderer)
          * SDL_CreateRenderer is calling it, and will call it again later
          * with a non-empty viewport.
          */
-        // SDL_Log("%s, no viewport was set!", __FUNCTION__);
+        // SDL_Log("%s, no viewport was set!", SDL_FUNCTION);
         return false;
     }
 
@@ -3482,7 +3528,7 @@ static void VULKAN_SetupShaderConstants(SDL_Renderer *renderer, const SDL_Render
     }
 }
 
-static VULKAN_Shader SelectShader(const VULKAN_PixelShaderConstants *shader_constants)
+static VULKAN_Shader SelectShader(const VULKAN_PixelShaderConstants *shader_constants, bool yuv)
 {
     if (!shader_constants) {
         return SHADER_SOLID;
@@ -3491,10 +3537,18 @@ static VULKAN_Shader SelectShader(const VULKAN_PixelShaderConstants *shader_cons
     if (shader_constants->texture_type == TEXTURETYPE_RGB &&
         shader_constants->input_type == INPUTTYPE_UNSPECIFIED &&
         shader_constants->tonemap_method == TONEMAP_NONE) {
-        return SHADER_RGB;
+        if (yuv) {
+            return SHADER_RGB_YUV;
+        } else {
+            return SHADER_RGB;
+        }
     }
 
-    return SHADER_ADVANCED;
+    if (yuv) {
+        return SHADER_ADVANCED_YUV;
+    } else {
+        return SHADER_ADVANCED;
+    }
 }
 
 static VkDescriptorPool VULKAN_AllocateDescriptorPool(VULKAN_RenderData *rendererData)
@@ -3685,8 +3739,7 @@ static VkDescriptorSet VULKAN_AllocateDescriptorSet(SDL_Renderer *renderer, VULK
     return descriptorSet;
 }
 
-static bool VULKAN_SetDrawState(SDL_Renderer *renderer, const SDL_RenderCommand *cmd, VkPipelineLayout pipelineLayout, VkDescriptorSetLayout descriptorSetLayout,
-    const VULKAN_PixelShaderConstants *shader_constants, VkPrimitiveTopology topology, int numImages, VkImageView *imageViews, int numSamplers, VkSampler *samplers, const Float4X4 *matrix, VULKAN_DrawStateCache *stateCache)
+static bool VULKAN_SetDrawState(SDL_Renderer *renderer, const SDL_RenderCommand *cmd, VkPipelineLayout pipelineLayout, VkDescriptorSetLayout descriptorSetLayout, const VULKAN_PixelShaderConstants *shader_constants, VkPrimitiveTopology topology, int numImages, VkImageView *imageViews, int numSamplers, VkSampler *samplers, const Float4X4 *matrix, VULKAN_DrawStateCache *stateCache, bool yuv)
 
 {
     VULKAN_RenderData *rendererData = (VULKAN_RenderData *)renderer->internal;
@@ -3694,7 +3747,7 @@ static bool VULKAN_SetDrawState(SDL_Renderer *renderer, const SDL_RenderCommand 
     VkFormat format = rendererData->surfaceFormat.format;
     const Float4X4 *newmatrix = matrix ? matrix : &rendererData->identity;
     bool updateConstants = false;
-    VULKAN_Shader shader = SelectShader(shader_constants);
+    VULKAN_Shader shader = SelectShader(shader_constants, yuv);
     VULKAN_PixelShaderConstants solid_constants;
     VkDescriptorSet descriptorSet;
     VkBuffer constantBuffer;
@@ -3834,6 +3887,11 @@ static bool VULKAN_SetDrawState(SDL_Renderer *renderer, const SDL_RenderCommand 
 
 static VkSampler VULKAN_GetSampler(VULKAN_RenderData *data, SDL_PixelFormat format, SDL_ScaleMode scale_mode, SDL_TextureAddressMode address_u, SDL_TextureAddressMode address_v)
 {
+    if (format == SDL_PIXELFORMAT_INDEX8) {
+        // We'll do linear sampling in the shader if needed
+        scale_mode = SDL_SCALEMODE_NEAREST;
+    }
+
     Uint32 key = RENDER_SAMPLER_HASHKEY(scale_mode, address_u, address_v);
     SDL_assert(key < SDL_arraysize(data->samplers));
     if (!data->samplers[key]) {
@@ -3853,14 +3911,8 @@ static VkSampler VULKAN_GetSampler(VULKAN_RenderData *data, SDL_PixelFormat form
             break;
         case SDL_SCALEMODE_PIXELART:    // Uses linear sampling
         case SDL_SCALEMODE_LINEAR:
-            if (format == SDL_PIXELFORMAT_INDEX8) {
-                // We'll do linear sampling in the shader
-                samplerCreateInfo.magFilter = VK_FILTER_NEAREST;
-                samplerCreateInfo.minFilter = VK_FILTER_NEAREST;
-            } else {
-                samplerCreateInfo.magFilter = VK_FILTER_LINEAR;
-                samplerCreateInfo.minFilter = VK_FILTER_LINEAR;
-            }
+            samplerCreateInfo.magFilter = VK_FILTER_LINEAR;
+            samplerCreateInfo.minFilter = VK_FILTER_LINEAR;
             break;
         default:
             SDL_SetError("Unknown scale mode: %d", scale_mode);
@@ -3909,6 +3961,7 @@ static bool VULKAN_SetCopyState(SDL_Renderer *renderer, const SDL_RenderCommand 
     VULKAN_PixelShaderConstants constants;
     VkDescriptorSetLayout descriptorSetLayout = (textureData->descriptorSetLayoutYcbcr != VK_NULL_HANDLE) ? textureData->descriptorSetLayoutYcbcr : rendererData->descriptorSetLayout;
     VkPipelineLayout pipelineLayout = (textureData->pipelineLayoutYcbcr != VK_NULL_HANDLE) ? textureData->pipelineLayoutYcbcr : rendererData->pipelineLayout;
+    bool yuv = (textureData->descriptorSetLayoutYcbcr != VK_NULL_HANDLE);
 
     VULKAN_SetupShaderConstants(renderer, cmd, texture, &constants);
 
@@ -3977,7 +4030,7 @@ static bool VULKAN_SetCopyState(SDL_Renderer *renderer, const SDL_RenderCommand 
         samplers[numSamplers++] = samplers[0];
     }
 
-    return VULKAN_SetDrawState(renderer, cmd, pipelineLayout, descriptorSetLayout, &constants, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, numImageViews, imageViews, numSamplers, samplers, matrix, stateCache);
+    return VULKAN_SetDrawState(renderer, cmd, pipelineLayout, descriptorSetLayout, &constants, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, numImageViews, imageViews, numSamplers, samplers, matrix, stateCache, yuv);
 }
 
 static void VULKAN_DrawPrimitives(SDL_Renderer *renderer, VkPrimitiveTopology primitiveTopology, const size_t vertexStart, const size_t vertexCount)
@@ -3991,6 +4044,9 @@ static void VULKAN_InvalidateCachedState(SDL_Renderer *renderer)
     VULKAN_RenderData *rendererData = (VULKAN_RenderData *)renderer->internal;
     rendererData->currentPipelineState = NULL;
     rendererData->cliprectDirty = true;
+
+    // Make sure pending drawing is submitted to the GPU
+    VULKAN_IssueBatch(rendererData);
 }
 
 static bool VULKAN_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd, void *vertices, size_t vertsize)
@@ -3998,7 +4054,7 @@ static bool VULKAN_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cm
     VULKAN_RenderData *rendererData = (VULKAN_RenderData *)renderer->internal;
     VkSurfaceTransformFlagBitsKHR currentRotation = VULKAN_GetRotationForCurrentRenderTarget(rendererData);
     VULKAN_DrawStateCache stateCache;
-    SDL_memset(&stateCache, 0, sizeof(stateCache));
+    SDL_zero(stateCache);
 
     if (!rendererData->device) {
         return SDL_SetError("Device lost and couldn't be recovered");
@@ -4085,14 +4141,14 @@ static bool VULKAN_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cm
             size_t line_start = 0;
             size_t line_end = line_start + count - 1;
             if (verts[line_start].pos[0] != verts[line_end].pos[0] || verts[line_start].pos[1] != verts[line_end].pos[1]) {
-                VULKAN_SetDrawState(renderer, cmd, rendererData->pipelineLayout, rendererData->descriptorSetLayout, NULL, VK_PRIMITIVE_TOPOLOGY_POINT_LIST, 0, NULL, 0, NULL, NULL, &stateCache);
+                VULKAN_SetDrawState(renderer, cmd, rendererData->pipelineLayout, rendererData->descriptorSetLayout, NULL, VK_PRIMITIVE_TOPOLOGY_POINT_LIST, 0, NULL, 0, NULL, NULL, &stateCache, false);
                 VULKAN_DrawPrimitives(renderer, VK_PRIMITIVE_TOPOLOGY_POINT_LIST, start + line_end, 1);
                 have_point_draw_state = true;
             }
 
             if (count > 2) {
                 // joined lines cannot be grouped
-                VULKAN_SetDrawState(renderer, cmd, rendererData->pipelineLayout, rendererData->descriptorSetLayout, NULL, VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, 0, NULL, 0, NULL, NULL, &stateCache);
+                VULKAN_SetDrawState(renderer, cmd, rendererData->pipelineLayout, rendererData->descriptorSetLayout, NULL, VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, 0, NULL, 0, NULL, NULL, &stateCache, false);
                 VULKAN_DrawPrimitives(renderer, VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, start, count);
             } else {
                 // let's group non joined lines
@@ -4122,7 +4178,7 @@ static bool VULKAN_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cm
                         line_end = line_start + nextcmd->data.draw.count - 1;
                         if (verts[line_start].pos[0] != verts[line_end].pos[0] || verts[line_start].pos[1] != verts[line_end].pos[1]) {
                             if (!have_point_draw_state) {
-                                VULKAN_SetDrawState(renderer, cmd, rendererData->pipelineLayout, rendererData->descriptorSetLayout, NULL, VK_PRIMITIVE_TOPOLOGY_POINT_LIST, 0, NULL, 0, NULL, NULL, &stateCache);
+                                VULKAN_SetDrawState(renderer, cmd, rendererData->pipelineLayout, rendererData->descriptorSetLayout, NULL, VK_PRIMITIVE_TOPOLOGY_POINT_LIST, 0, NULL, 0, NULL, NULL, &stateCache, false);
                                 have_point_draw_state = true;
                             }
                             VULKAN_DrawPrimitives(renderer, VK_PRIMITIVE_TOPOLOGY_POINT_LIST, start + line_end, 1);
@@ -4131,7 +4187,7 @@ static bool VULKAN_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cm
                     }
                 }
 
-                VULKAN_SetDrawState(renderer, cmd, rendererData->pipelineLayout, rendererData->descriptorSetLayout, NULL, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, 0, NULL, 0, NULL, NULL, &stateCache);
+                VULKAN_SetDrawState(renderer, cmd, rendererData->pipelineLayout, rendererData->descriptorSetLayout, NULL, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, 0, NULL, 0, NULL, NULL, &stateCache, false);
                 VULKAN_DrawPrimitives(renderer, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, start, count);
 
                 cmd = finalcmd; // skip any copy commands we just combined in here.
@@ -4190,12 +4246,12 @@ static bool VULKAN_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cm
                 if (thistexture) {
                     VULKAN_SetCopyState(renderer, cmd, NULL, &stateCache);
                 } else {
-                    VULKAN_SetDrawState(renderer, cmd, rendererData->pipelineLayout, rendererData->descriptorSetLayout, NULL, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 0, NULL, 0, NULL, NULL, &stateCache);
+                    VULKAN_SetDrawState(renderer, cmd, rendererData->pipelineLayout, rendererData->descriptorSetLayout, NULL, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, 0, NULL, 0, NULL, NULL, &stateCache, false);
                 }
 
                 VULKAN_DrawPrimitives(renderer, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, start, count);
             } else {
-                VULKAN_SetDrawState(renderer, cmd, rendererData->pipelineLayout, rendererData->descriptorSetLayout, NULL, VK_PRIMITIVE_TOPOLOGY_POINT_LIST, 0, NULL, 0, NULL, NULL, &stateCache);
+                VULKAN_SetDrawState(renderer, cmd, rendererData->pipelineLayout, rendererData->descriptorSetLayout, NULL, VK_PRIMITIVE_TOPOLOGY_POINT_LIST, 0, NULL, 0, NULL, NULL, &stateCache, false);
                 VULKAN_DrawPrimitives(renderer, VK_PRIMITIVE_TOPOLOGY_POINT_LIST, start, count);
             }
             cmd = finalcmd; // skip any copy commands we just combined in here.
@@ -4540,8 +4596,11 @@ static bool VULKAN_CreateRenderer(SDL_Renderer *renderer, SDL_Window *window, SD
     VULKAN_InvalidateCachedState(renderer);
 
     renderer->name = VULKAN_RenderDriver.name;
-    SDL_AddSupportedTextureFormat(renderer, SDL_PIXELFORMAT_ARGB8888);
+    SDL_AddSupportedTextureFormat(renderer, SDL_PIXELFORMAT_BGRA32);    // SDL_PIXELFORMAT_ARGB8888 on little endian systems
+    SDL_AddSupportedTextureFormat(renderer, SDL_PIXELFORMAT_RGBA32);
+#if SDL_BYTEORDER == SDL_BIG_ENDIAN
     SDL_AddSupportedTextureFormat(renderer, SDL_PIXELFORMAT_ABGR8888);
+#endif
     SDL_AddSupportedTextureFormat(renderer, SDL_PIXELFORMAT_ABGR2101010);
     SDL_AddSupportedTextureFormat(renderer, SDL_PIXELFORMAT_RGBA64_FLOAT);
     SDL_AddSupportedTextureFormat(renderer, SDL_PIXELFORMAT_INDEX8);

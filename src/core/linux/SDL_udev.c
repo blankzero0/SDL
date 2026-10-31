@@ -1,6 +1,6 @@
 /*
   Simple DirectMedia Layer
-  Copyright (C) 1997-2025 Sam Lantinga <slouken@libsdl.org>
+  Copyright (C) 1997-2026 Sam Lantinga <slouken@libsdl.org>
 
   This software is provided 'as-is', without any express or implied
   warranty.  In no event will the authors be held liable for any damages
@@ -51,7 +51,7 @@ SDL_ELF_NOTE_DLOPEN(
     "Support for events through libudev",
     SDL_ELF_NOTE_DLOPEN_PRIORITY_RECOMMENDED,
     SDL_UDEV_DLNOTE_LIBS
-);
+)
 
 static SDL_UDEV_PrivateData *_this = NULL;
 
@@ -464,6 +464,7 @@ static int device_class(struct udev_device *dev)
 {
     const char *subsystem;
     const char *val = NULL;
+    const char *attr = NULL;
     int devclass = 0;
 
     subsystem = _this->syms.udev_device_get_subsystem(dev);
@@ -475,8 +476,18 @@ static int device_class(struct udev_device *dev)
         devclass = SDL_UDEV_DEVICE_SOUND;
     } else if (SDL_strcmp(subsystem, "video4linux") == 0) {
         val = _this->syms.udev_device_get_property_value(dev, "ID_V4L_CAPABILITIES");
-        if (val && SDL_strcasestr(val, "capture")) {
-            devclass = SDL_UDEV_DEVICE_VIDEO_CAPTURE;
+        if (val) {
+            if (SDL_strcasestr(val, "capture")) {
+                devclass = SDL_UDEV_DEVICE_VIDEO_CAPTURE;
+            }
+            // v4l2loopback may report output caps before reporting capture caps
+            // and ID_V4L_CAPABILITIES is never updated
+            else if (SDL_strcasestr(val, "video_output")) {
+                attr = _this->syms.udev_device_get_sysattr_value(dev, "state");
+                if (attr && SDL_strcmp(attr, "capture") == 0) {
+                    devclass = SDL_UDEV_DEVICE_VIDEO_CAPTURE;
+                }
+            }
         }
     } else if (SDL_strcmp(subsystem, "input") == 0) {
         // udev rules reference: http://cgit.freedesktop.org/systemd/systemd/tree/src/udev/udev-builtin-input_id.c

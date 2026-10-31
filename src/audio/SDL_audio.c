@@ -1,6 +1,6 @@
 /*
   Simple DirectMedia Layer
-  Copyright (C) 1997-2025 Sam Lantinga <slouken@libsdl.org>
+  Copyright (C) 1997-2026 Sam Lantinga <slouken@libsdl.org>
 
   This software is provided 'as-is', without any express or implied
   warranty.  In no event will the authors be held liable for any damages
@@ -736,11 +736,29 @@ SDL_AudioDevice *SDL_AddAudioDevice(bool recording, const char *name, const SDL_
     return device;
 }
 
+// you must hold the device lock when calling this!
+static void SetAudioDeviceZombieFunctions(SDL_AudioDevice *device)
+{
+    // Swap in "Zombie" versions of the usual platform interfaces, so the device will keep
+    // making progress until the app closes it. Otherwise, streams might continue to
+    // accumulate waste data that never drains, apps that depend on audio callbacks to
+    // progress will freeze, etc.
+    device->WaitDevice = ZombieWaitDevice;
+    device->GetDeviceBuf = ZombieGetDeviceBuf;
+    device->PlayDevice = ZombiePlayDevice;
+    device->WaitRecordingDevice = ZombieWaitDevice;
+    device->RecordDevice = ZombieRecordDevice;
+    device->FlushRecording = ZombieFlushRecording;
+}
+
 // Called when a device is removed from the system, or it fails unexpectedly, from any thread, possibly even the audio device's thread.
 static void SDLCALL SDL_AudioDeviceDisconnected_OnMainThread(void *userdata)
 {
-    SDL_AudioDevice *device = (SDL_AudioDevice *) userdata;
-    SDL_assert(device != NULL);
+    const SDL_AudioDeviceID devid = (SDL_AudioDeviceID) (size_t) userdata;
+    SDL_AudioDevice *device = ObtainPhysicalAudioDevice(devid);
+    if (device == NULL) {
+        return;  // apparently it went away already.
+    }
 
     // Save off removal info in a list so we can send events for each, next
     //  time the event queue pumps, in case something tries to close a device
@@ -750,25 +768,14 @@ static void SDLCALL SDL_AudioDeviceDisconnected_OnMainThread(void *userdata)
     pending.next = NULL;
     SDL_PendingAudioDeviceEvent *pending_tail = &pending;
 
-    ObtainPhysicalAudioDeviceObj(device);
-
     SDL_LockRWLockForReading(current_audio.subsystem_rwlock);
-    const SDL_AudioDeviceID devid = device->instance_id;
     const bool is_default_device = ((devid == current_audio.default_playback_device_id) || (devid == current_audio.default_recording_device_id));
     SDL_UnlockRWLock(current_audio.subsystem_rwlock);
 
-    const bool first_disconnect = SDL_CompareAndSwapAtomicInt(&device->zombie, 0, 1);
+    // zombie==2 means "we've handled the disconnect events". 1=="we marked this as dead from a random thread but haven't done anything else"  0==we think we're still alive.
+    const bool first_disconnect = SDL_CompareAndSwapAtomicInt(&device->zombie, 0, 2) || SDL_CompareAndSwapAtomicInt(&device->zombie, 1, 2);
     if (first_disconnect) {   // if already disconnected this device, don't do it twice.
-        // Swap in "Zombie" versions of the usual platform interfaces, so the device will keep
-        // making progress until the app closes it. Otherwise, streams might continue to
-        // accumulate waste data that never drains, apps that depend on audio callbacks to
-        // progress will freeze, etc.
-        device->WaitDevice = ZombieWaitDevice;
-        device->GetDeviceBuf = ZombieGetDeviceBuf;
-        device->PlayDevice = ZombiePlayDevice;
-        device->WaitRecordingDevice = ZombieWaitDevice;
-        device->RecordDevice = ZombieRecordDevice;
-        device->FlushRecording = ZombieFlushRecording;
+        SetAudioDeviceZombieFunctions(device);  // in case we beat the device thread to this.
 
         // on default devices, dump any logical devices that explicitly opened this device. Things that opened the system default can stay.
         // on non-default devices, dump everything.
@@ -819,13 +826,16 @@ static void SDLCALL SDL_AudioDeviceDisconnected_OnMainThread(void *userdata)
 
 void SDL_AudioDeviceDisconnected(SDL_AudioDevice *device)
 {
+    //SDL_Log("AUDIO DEVICE DISCONNECTED %p '%s'", device, device ? device->name : NULL);
+
     // lots of risk of various audio backends deadlocking because they're calling
     // this while holding a backend-specific lock, which causes problems when we
     // want to obtain the device lock while its audio thread is also waiting for
     // that lock to be released. So just queue the work on the main thread.
     if (device) {
         RefPhysicalAudioDevice(device);
-        SDL_RunOnMainThread(SDL_AudioDeviceDisconnected_OnMainThread, device, false);
+        SDL_CompareAndSwapAtomicInt(&device->zombie, 0, 1);  // note that we're (un)dead right now, if we haven't already, but leave the event notifications for the main thread.
+        SDL_RunOnMainThread(SDL_AudioDeviceDisconnected_OnMainThread, (void *) (size_t) device->instance_id, false);
     }
 }
 
@@ -1180,6 +1190,11 @@ bool SDL_PlaybackAudioThreadIterate(SDL_AudioDevice *device)
         return false;  // we're done, shut it down.
     }
 
+    if (SDL_GetAtomicInt(&device->zombie) == 1) {
+        // we've been marked as (un)dead but not fully processed. Set up the zombie functions so we stop talking to the real backend.
+        SetAudioDeviceZombieFunctions(device);
+    }
+
     bool failed = false;
     int buffer_size = device->buffer_size;
     Uint8 *device_buffer = device->GetDeviceBuf(device, &buffer_size);
@@ -1344,6 +1359,11 @@ bool SDL_RecordingAudioThreadIterate(SDL_AudioDevice *device)
     if (SDL_GetAtomicInt(&device->shutdown)) {
         SDL_UnlockMutex(device->lock);
         return false;  // we're done, shut it down.
+    }
+
+    if (SDL_GetAtomicInt(&device->zombie) == 1) {
+        // we've been marked as (un)dead but not fully processed. Set up the zombie functions so we stop talking to the real backend.
+        SetAudioDeviceZombieFunctions(device);
     }
 
     bool failed = false;
@@ -1579,6 +1599,14 @@ const char *SDL_GetAudioDeviceName(SDL_AudioDeviceID devid)
         // remains valid (in case the device is unplugged at the wrong moment), we hold the
         // subsystem_rwlock while we copy the string.
         SDL_LockRWLockForReading(current_audio.subsystem_rwlock);
+
+        // Allow default device IDs to be used, just return the current default physical device's name.
+        if (devid == SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK) {
+            devid = current_audio.default_playback_device_id;
+        } else if (devid == SDL_AUDIO_DEVICE_DEFAULT_RECORDING) {
+            devid = current_audio.default_recording_device_id;
+        }
+
         SDL_FindInHashTable(islogical ? current_audio.device_hash_logical : current_audio.device_hash_physical, (const void *) (uintptr_t) devid, &vdev);
         if (!vdev) {
             SDL_SetError("Invalid audio device instance ID");
@@ -1800,21 +1828,18 @@ static bool OpenPhysicalAudioDevice(SDL_AudioDevice *device, const SDL_AudioSpec
     SDL_copyp(&spec, inspec ? inspec : &device->default_spec);
     PrepareAudioFormat(device->recording, &spec);
 
-    if (!SDL_GetHintBoolean(SDL_HINT_AUDIO_ENFORCE_MINIMUM_SPEC, true)) {
-        SDL_copyp(&device->spec, &spec);
-    } else {
-        /* We impose a simple minimum on device formats. This prevents something low quality, like an old game using S8/8000Hz audio,
-           from ruining a music thing playing at CD quality that tries to open later, or some VoIP library that opens for mono output
-           ruining your surround-sound game because it got there first.
-           These are just requests! The backend may change any of these values during OpenDevice method! */
-        const SDL_AudioFormat minimum_format = device->recording ? DEFAULT_AUDIO_RECORDING_FORMAT : DEFAULT_AUDIO_PLAYBACK_FORMAT;
-        const int minimum_channels = device->recording ? DEFAULT_AUDIO_RECORDING_CHANNELS : DEFAULT_AUDIO_PLAYBACK_CHANNELS;
-        const int minimum_freq = device->recording ? DEFAULT_AUDIO_RECORDING_FREQUENCY : DEFAULT_AUDIO_PLAYBACK_FREQUENCY;
-        device->spec.format = (SDL_AUDIO_BITSIZE(minimum_format) >= SDL_AUDIO_BITSIZE(spec.format)) ? minimum_format : spec.format;
-        device->spec.channels = SDL_max(minimum_channels, spec.channels);
-        device->spec.freq = SDL_max(minimum_freq, spec.freq);
-    }
+    /* We impose a simple minimum on device formats. This prevents something low quality, like an old game using S8/8000Hz audio,
+       from ruining a music thing playing at CD quality that tries to open later, or some VoIP library that opens for mono output
+       ruining your surround-sound game because it got there first.
+       These are just requests! The backend may change any of these values during OpenDevice method! */
 
+    const SDL_AudioFormat minimum_format = device->recording ? DEFAULT_AUDIO_RECORDING_FORMAT : DEFAULT_AUDIO_PLAYBACK_FORMAT;
+    const int minimum_channels = device->recording ? DEFAULT_AUDIO_RECORDING_CHANNELS : DEFAULT_AUDIO_PLAYBACK_CHANNELS;
+    const int minimum_freq = device->recording ? DEFAULT_AUDIO_RECORDING_FREQUENCY : DEFAULT_AUDIO_PLAYBACK_FREQUENCY;
+
+    device->spec.format = (SDL_AUDIO_BITSIZE(minimum_format) >= SDL_AUDIO_BITSIZE(spec.format)) ? minimum_format : spec.format;
+    device->spec.channels = SDL_max(minimum_channels, spec.channels);
+    device->spec.freq = SDL_max(minimum_freq, spec.freq);
     device->sample_frames = SDL_GetDefaultSampleFramesFromFreq(device->spec.freq);
     SDL_UpdatedAudioDeviceFormat(device);  // start this off sane.
 
@@ -2450,6 +2475,9 @@ void SDL_DefaultAudioDeviceChanged(SDL_AudioDevice *new_default_device)
                 logdev->physical_device = new_default_device;
                 logdev->prev = NULL;
                 logdev->next = new_default_device->logical_devices;
+                if (new_default_device->logical_devices) {
+                    new_default_device->logical_devices->prev = logdev;
+                }
                 new_default_device->logical_devices = logdev;
                 SDL_UnlockRWLock(current_audio.subsystem_rwlock);
 

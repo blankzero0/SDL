@@ -1,6 +1,6 @@
 /*
   Simple DirectMedia Layer
-  Copyright (C) 1997-2025 Sam Lantinga <slouken@libsdl.org>
+  Copyright (C) 1997-2026 Sam Lantinga <slouken@libsdl.org>
   Copyright (C) 2024 Wim Taymans <wtaymans@redhat.com>
 
   This software is provided 'as-is', without any express or implied
@@ -114,7 +114,7 @@ SDL_ELF_NOTE_DLOPEN(
     "Support for camera through libpipewire",
     SDL_ELF_NOTE_DLOPEN_PRIORITY_SUGGESTED,
     SDL_CAMERA_DRIVER_PIPEWIRE_DYNAMIC
-);
+)
 
 static const char *pipewire_library = SDL_CAMERA_DRIVER_PIPEWIRE_DYNAMIC;
 static SDL_SharedObject *pipewire_handle = NULL;
@@ -577,7 +577,7 @@ static bool PIPEWIRECAMERA_WaitDevice(SDL_Camera *device)
     return true;
 }
 
-static SDL_CameraFrameResult PIPEWIRECAMERA_AcquireFrame(SDL_Camera *device, SDL_Surface *frame, Uint64 *timestampNS)
+static SDL_CameraFrameResult PIPEWIRECAMERA_AcquireFrame(SDL_Camera *device, SDL_Surface *frame, Uint64 *timestampNS, float *rotation)
 {
     struct pw_buffer *b;
 

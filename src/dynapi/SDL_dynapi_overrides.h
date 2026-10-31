@@ -1,6 +1,6 @@
 /*
   Simple DirectMedia Layer
-  Copyright (C) 1997-2025 Sam Lantinga <slouken@libsdl.org>
+  Copyright (C) 1997-2026 Sam Lantinga <slouken@libsdl.org>
 
   This software is provided 'as-is', without any express or implied
   warranty.  In no event will the authors be held liable for any damages
@@ -1296,4 +1296,5 @@
 #define SDL_RotateSurface SDL_RotateSurface_REAL
 #define SDL_LoadSurface_IO SDL_LoadSurface_IO_REAL
 #define SDL_LoadSurface SDL_LoadSurface_REAL
+#define SDL_SetWindowFillDocument SDL_SetWindowFillDocument_REAL
 #define SDL_SetWindowMousePassthrough SDL_SetWindowMousePassthrough_REAL

@@ -1,6 +1,6 @@
 /*
   Simple DirectMedia Layer
-  Copyright (C) 1997-2025 Sam Lantinga <slouken@libsdl.org>
+  Copyright (C) 1997-2026 Sam Lantinga <slouken@libsdl.org>
 
   This software is provided 'as-is', without any express or implied
   warranty.  In no event will the authors be held liable for any damages
@@ -22,6 +22,7 @@
 
 #ifdef SDL_VIDEO_RENDER_GPU
 
+#include "../../events/SDL_windowevents_c.h"
 #include "../../video/SDL_pixels_c.h"
 #include "../SDL_d3dmath.h"
 #include "../SDL_sysrender.h"
@@ -522,7 +523,6 @@ static bool GPU_UpdateTexture(SDL_Renderer *renderer, SDL_Texture *texture, cons
         if (texture->format == SDL_PIXELFORMAT_P010) {
             UVpitch = (pitch + 3) & ~3;
         } else {
-            bpp = 1;
             UVpitch = (pitch + 1) & ~1;
         }
         retval &= GPU_UpdateTextureInternal(renderdata, cpass, data->textureNV, bpp, rect->x / 2, rect->y / 2, (rect->w + 1) / 2, (rect->h + 1) / 2, UVplane, UVpitch);
@@ -534,8 +534,13 @@ static bool GPU_UpdateTexture(SDL_Renderer *renderer, SDL_Texture *texture, cons
         const Uint8 *Uplane = Yplane + rect->h * Ypitch;
         const Uint8 *Vplane = Uplane + ((rect->h + 1) / 2) * UVpitch;
 
-        retval &= GPU_UpdateTextureInternal(renderdata, cpass, data->textureU, bpp, rect->x / 2, rect->y / 2, (rect->w + 1) / 2, (rect->h + 1) / 2, Uplane, UVpitch);
-        retval &= GPU_UpdateTextureInternal(renderdata, cpass, data->textureV, bpp, rect->x / 2, rect->y / 2, (rect->w + 1) / 2, (rect->h + 1) / 2, Vplane, UVpitch);
+        if (texture->format == SDL_PIXELFORMAT_YV12) {
+            retval &= GPU_UpdateTextureInternal(renderdata, cpass, data->textureV, bpp, rect->x / 2, rect->y / 2, (rect->w + 1) / 2, (rect->h + 1) / 2, Uplane, UVpitch);
+            retval &= GPU_UpdateTextureInternal(renderdata, cpass, data->textureU, bpp, rect->x / 2, rect->y / 2, (rect->w + 1) / 2, (rect->h + 1) / 2, Vplane, UVpitch);
+        } else {
+            retval &= GPU_UpdateTextureInternal(renderdata, cpass, data->textureU, bpp, rect->x / 2, rect->y / 2, (rect->w + 1) / 2, (rect->h + 1) / 2, Uplane, UVpitch);
+            retval &= GPU_UpdateTextureInternal(renderdata, cpass, data->textureV, bpp, rect->x / 2, rect->y / 2, (rect->w + 1) / 2, (rect->h + 1) / 2, Vplane, UVpitch);
+        }
     }
 #endif
 
@@ -770,6 +775,11 @@ static void SetViewportAndScissor(GPU_RenderData *data)
 
 static SDL_GPUSampler *GetSampler(GPU_RenderData *data, SDL_PixelFormat format, SDL_ScaleMode scale_mode, SDL_TextureAddressMode address_u, SDL_TextureAddressMode address_v)
 {
+    if (format == SDL_PIXELFORMAT_INDEX8) {
+        // We'll do linear sampling in the shader if needed
+        scale_mode = SDL_SCALEMODE_NEAREST;
+    }
+
     Uint32 key = RENDER_SAMPLER_HASHKEY(scale_mode, address_u, address_v);
     SDL_assert(key < SDL_arraysize(data->samplers));
     if (!data->samplers[key]) {
@@ -783,16 +793,9 @@ static SDL_GPUSampler *GetSampler(GPU_RenderData *data, SDL_PixelFormat format, 
             break;
         case SDL_SCALEMODE_PIXELART:    // Uses linear sampling
         case SDL_SCALEMODE_LINEAR:
-            if (format == SDL_PIXELFORMAT_INDEX8) {
-                // We'll do linear sampling in the shader
-                sci.min_filter = SDL_GPU_FILTER_NEAREST;
-                sci.mag_filter = SDL_GPU_FILTER_NEAREST;
-                sci.mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_NEAREST;
-            } else {
-                sci.min_filter = SDL_GPU_FILTER_LINEAR;
-                sci.mag_filter = SDL_GPU_FILTER_LINEAR;
-                sci.mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_LINEAR;
-            }
+            sci.min_filter = SDL_GPU_FILTER_LINEAR;
+            sci.mag_filter = SDL_GPU_FILTER_LINEAR;
+            sci.mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_LINEAR;
             break;
         default:
             SDL_SetError("Unknown scale mode: %d", scale_mode);
@@ -1453,6 +1456,8 @@ static bool CreateBackbuffer(GPU_RenderData *data, Uint32 w, Uint32 h, SDL_GPUTe
     tci.sample_count = SDL_GPU_SAMPLECOUNT_1;
     tci.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
 
+    SDL_ReleaseGPUTexture(data->device, data->backbuffer.texture);
+
     data->backbuffer.texture = SDL_CreateGPUTexture(data->device, &tci);
     data->backbuffer.width = w;
     data->backbuffer.height = h;
@@ -1497,6 +1502,9 @@ static bool GPU_RenderPresent(SDL_Renderer *renderer)
 
             if (swapchain_texture_width != data->backbuffer.width || swapchain_texture_height != data->backbuffer.height) {
                 CreateBackbuffer(data, swapchain_texture_width, swapchain_texture_height, SDL_GetGPUSwapchainTextureFormat(data->device, renderer->window));
+
+                // Notify the application that it needs to redraw this frame
+                SDL_SendWindowEvent(renderer->window, SDL_EVENT_WINDOW_EXPOSED, 0, 0);
             }
         } else {
             SDL_SubmitGPUCommandBuffer(data->state.command_buffer);
@@ -1542,6 +1550,20 @@ static void GPU_DestroyTexture(SDL_Renderer *renderer, SDL_Texture *texture)
     texture->internal = NULL;
 }
 
+#ifdef SDL_PLATFORM_GDK
+static bool SDLCALL GPU_GDKEventFilter(void *userdata, SDL_Event *event)
+{
+    GPU_RenderData *data = (GPU_RenderData *)userdata;
+    SDL_assert(!data->external_device);
+    if (event->type == SDL_EVENT_DID_ENTER_BACKGROUND) {
+        SDL_GDKSuspendGPU(data->device);
+    } else if (event->type == SDL_EVENT_WILL_ENTER_FOREGROUND) {
+        SDL_GDKResumeGPU(data->device);
+    }
+    return true;
+}
+#endif
+
 static void GPU_DestroyRenderer(SDL_Renderer *renderer)
 {
     GPU_RenderData *data = (GPU_RenderData *)renderer->internal;
@@ -1575,6 +1597,9 @@ static void GPU_DestroyRenderer(SDL_Renderer *renderer)
     if (data->device) {
         GPU_ReleaseShaders(&data->shaders, data->device);
         if (!data->external_device) {
+#ifdef SDL_PLATFORM_GDK
+            SDL_RemoveEventWatch(GPU_GDKEventFilter, data);
+#endif
             SDL_DestroyGPUDevice(data->device);
         }
     }
@@ -1703,6 +1728,12 @@ static bool GPU_CreateRenderer(SDL_Renderer *renderer, SDL_Window *window, SDL_P
         SDL_SetBooleanProperty(create_props, SDL_PROP_GPU_DEVICE_CREATE_DEBUGMODE_BOOLEAN, debug);
         SDL_SetBooleanProperty(create_props, SDL_PROP_GPU_DEVICE_CREATE_PREFERLOWPOWER_BOOLEAN, lowpower);
 
+        // Vulkan windows get the Vulkan GPU backend by default
+        if (!SDL_HasProperty(create_props, SDL_PROP_GPU_DEVICE_CREATE_NAME_STRING) &&
+            (SDL_GetWindowFlags(window) & SDL_WINDOW_VULKAN)) {
+            SDL_SetStringProperty(create_props, SDL_PROP_GPU_DEVICE_CREATE_NAME_STRING, "vulkan");
+        }
+
         // Set hints for the greatest hardware compatibility
         // This property allows using the renderer on Intel Haswell and Broadwell GPUs.
         if (!SDL_HasProperty(create_props, SDL_PROP_GPU_DEVICE_CREATE_D3D12_ALLOW_FEWER_RESOURCE_SLOTS_BOOLEAN)) {
@@ -1721,6 +1752,10 @@ static bool GPU_CreateRenderer(SDL_Renderer *renderer, SDL_Window *window, SDL_P
         if (!SDL_HasProperty(create_props, SDL_PROP_GPU_DEVICE_CREATE_FEATURE_ANISOTROPY_BOOLEAN)) {
             SDL_SetBooleanProperty(create_props, SDL_PROP_GPU_DEVICE_CREATE_FEATURE_ANISOTROPY_BOOLEAN, false);
         }
+        // These properties allow using the renderer on more macOS devices.
+        if (!SDL_HasProperty(create_props, SDL_PROP_GPU_DEVICE_CREATE_METAL_ALLOW_MACFAMILY1_BOOLEAN)) {
+            SDL_SetBooleanProperty(create_props, SDL_PROP_GPU_DEVICE_CREATE_METAL_ALLOW_MACFAMILY1_BOOLEAN, false);
+        }
 
         GPU_FillSupportedShaderFormats(create_props);
         data->device = SDL_CreateGPUDeviceWithProperties(create_props);
@@ -1728,6 +1763,10 @@ static bool GPU_CreateRenderer(SDL_Renderer *renderer, SDL_Window *window, SDL_P
         if (!data->device) {
             return false;
         }
+
+#ifdef SDL_PLATFORM_GDK
+        SDL_AddEventWatch(GPU_GDKEventFilter, data);
+#endif
     }
 
     if (!GPU_InitShaders(&data->shaders, data->device)) {
@@ -1777,10 +1816,10 @@ static bool GPU_CreateRenderer(SDL_Renderer *renderer, SDL_Window *window, SDL_P
         }
     }
 
-    SDL_AddSupportedTextureFormat(renderer, SDL_PIXELFORMAT_ARGB8888);
-    SDL_AddSupportedTextureFormat(renderer, SDL_PIXELFORMAT_ABGR8888);
-    SDL_AddSupportedTextureFormat(renderer, SDL_PIXELFORMAT_XRGB8888);
-    SDL_AddSupportedTextureFormat(renderer, SDL_PIXELFORMAT_XBGR8888);
+    SDL_AddSupportedTextureFormat(renderer, SDL_PIXELFORMAT_BGRA32);    // SDL_PIXELFORMAT_ARGB8888 on little endian systems
+    SDL_AddSupportedTextureFormat(renderer, SDL_PIXELFORMAT_RGBA32);
+    SDL_AddSupportedTextureFormat(renderer, SDL_PIXELFORMAT_BGRX32);
+    SDL_AddSupportedTextureFormat(renderer, SDL_PIXELFORMAT_RGBX32);
     SDL_AddSupportedTextureFormat(renderer, SDL_PIXELFORMAT_ABGR2101010);
     SDL_AddSupportedTextureFormat(renderer, SDL_PIXELFORMAT_RGBA64_FLOAT);
     SDL_AddSupportedTextureFormat(renderer, SDL_PIXELFORMAT_INDEX8);
